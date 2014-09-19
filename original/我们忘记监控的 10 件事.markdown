@@ -1,0 +1,342 @@
+# 我们忘记监控的 10 件事
+
+标签（空格分隔）： 监控 monitor 
+
+---
+
+> 注：该文作者为 [ehiah][1]，原文地址为 [10 Things We Forgot to Monitor][2]
+
+总有一组标准的统一监控指标（Disk Usage, Memory Usage, Load, Pings 等等）。除了那个以外，我们还有从操作我们的生产系统学习到的很多经验，帮助我们形成监控的广度。
+
+我喜欢的其中一条 tweets 是来自于 @DevOps_Borat：
+> "Law of Murphy for devops: if thing can able go wrong, is mean is already wrong but you not have Nagios alert of it yet."
+
+> devops 的墨菲定律：如果事情可能出错了，那意味着它已经是错误的但你还没有使用 Nagios 为它报警。
+
+下面是我在 bitly 的一个监控小清单，它来自于成长的经验（有时是痛苦的），和那些实例后面之后的小的故事片段。
+
+## 1 - Fork Rate
+
+我曾经有过这样一个问题，故意通过在 `/etc/modprobe.conf` 中使用 `options ipv6 disable=1` 和 `alias ipv6 off` 来禁掉 IPv6。这给我们带来了一个大的问题：每次一个新的 curl 对象被创建，`modprobe` 将大量产生，检查 `net-pf-10` 来评估 IPv6 的状态。这个 fork 轰炸了 box，然后我们终于通过观察 `/proc/stat` 中的进程数量以每秒几百的增加来追踪到了原因。我们的正常期望是一个稳定的网络的生产环境中 fork 速率是每秒 1-10 。
+
+```
+#!/bin/bash
+# Copyright bitly, Aug 2011 
+# written by Jehiah Czebotar
+ 
+DATAFILE="/var/tmp/nagios_check_forkrate.dat"
+VALID_INTERVAL=600
+ 
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=-1
+ 
+function usage()
+{
+    echo "usage: $0 --warn=<int> --critical=<int>"
+    echo "this script checks the rate processes are created"
+    echo "and alerts when it goes above a certain threshold"
+    echo "it saves the value from each run in $DATAFILE"
+    echo "and computes a delta on the next run. It will ignore"
+    echo "any values that are older than --valid-interval=$VALID_INTERVAL (seconds)"
+    echo "warn and critical values are in # of new processes per second"
+}
+ 
+while [ "$1" != "" ]; do
+    PARAM=`echo $1 | awk -F= '{print $1}'`
+    VALUE=`echo $1 | awk -F= '{print $2}'`
+    case $PARAM in
+        -w | --warn)
+            WARN_THRESHOLD=$VALUE
+            ;;
+        -c | --critical)
+            CRITICAL_THRESHOLD=$VALUE
+            ;;
+        --valid-interval)
+            VALID_INTERVAL=$VALUE
+            ;;
+        -h | --help)
+            usage
+            exit 0;
+            ;;
+    esac
+    shift
+done
+ 
+if [ -z "$WARN_THRESHOLD" ] || [ -z "$CRITICAL_THRESHOLD" ]; then
+    echo "error: --warn and --critical parameters are required"
+    exit $UNKNOWN
+fi
+if [[ $WARN_THRESHOLD -ge $CRITICAL_THRESHOLD ]]; then
+    echo "error: --warn ($WARN_THRESHOLD) can't be greater than --critical ($CRITICAL_THRESHOLD)"
+    exit $UNKNOWN
+fi
+ 
+NOW=`date +%s`
+min_valid_ts=$(($NOW - $VALID_INTERVAL))
+current_process_count=`awk '/processes/ {print $2}' /proc/stat`
+ 
+if [ ! -f $DATAFILE ]; then
+    mkdir -p $(dirname $DATAFILE)
+    echo -e "$NOW\t$current_process_count" > $DATAFILE
+    echo "Missing $DATAFILE; creating"
+    exit $UNKNOWN
+fi
+ 
+# now compare this to previous
+mv $DATAFILE{,.previous}
+while read ts process_count; do
+    if [[ $ts -lt $min_valid_ts ]]; then
+        continue
+    fi
+    if [[ $ts -ge $NOW ]]; then
+        # we can't use data from the same second
+        continue
+    fi
+    # calculate the rate
+    process_delta=$(($current_process_count - $process_count))
+    ts_delta=$(($NOW - $ts))
+    current_fork_rate=`echo "$process_delta / $ts_delta" | bc`
+    echo -e "$ts\t$process_count" >> $DATAFILE
+done < $DATAFILE.previous
+echo -e "$NOW\t$current_process_count" >> $DATAFILE
+ 
+echo "fork rate is $current_fork_rate processes/second (based on the last $ts_delta seconds)"
+if [[ $current_fork_rate -ge $CRITICAL_THRESHOLD ]]; then
+    exit $CRITICAL
+fi
+if [[ $current_fork_rate -ge $WARN_THRESHOLD ]]; then
+    exit $WARNING
+fi
+exit $OK
+```
+
+## 2 - flow control packets
+
+[TL;DR;][3] 如果你的网络配置了优异的 flow control packets 并且没有配置禁止它，你可以暂时的引起丢弃流量。（如果这听起来不像一个中断，你需要检查你的头。）
+
+```
+$ /usr/sbin/ethtool -S eth0 | grep flow_control
+rx_flow_control_xon: 0
+rx_flow_control_xoff: 0
+tx_flow_control_xon: 0
+tx_flow_control_xoff: 0
+```
+
+注意：读[这个][4]来弄明白如何将这些 flow control frames 级联到 switch-wide 的 连接丢失，如果你使用了特定的 Broadcom NIC’s，你应该在你的 switch gear 趋势你的指标。不仅于此，还要观察你的丢帧现象。
+
+> 注：how these flow control frames can cascade to switch-wide loss of connectivity （不知道怎么翻译，然后含义是什么，求大神解析）
+
+## 3 - Swap In/Out Rate
+
+通常检查的是 swap 使用是否超过了一个阀值，但是即使你有少量的内存交换，这个实际的 swapped in/out 的速率都可能影响性能，而不是数量。这是一个更直接的检查那个状态的脚本：
+
+```
+#!/bin/bash
+# Show the rate of swapping (in number of pages) between executions
+ 
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=-1
+EXITFLAG=$OK
+ 
+WARN_THRESHOLD=1
+CRITICAL_THRESHOLD=100
+ 
+IN_DATAFILE="/var/tmp/nagios_check_swap_pages_in.dat"
+OUT_DATAFILE="/var/tmp/nagios_check_swap_pages_out.dat"
+VALID_INTERVAL=600
+ 
+function usage()
+{
+    echo "usage: $0 --warn=<pages per second in or out> --critical=<pages per second in or out>"
+    echo "Script checks for any swap usage"
+}
+ 
+while [ "$1" != "" ]; do
+    PARAM=`echo $1 | awk -F= '{print $1}'`
+    VALUE=`echo $1 | awk -F= '{print $2}'`
+    case $PARAM in
+        --warn)
+            WARN_THRESHOLD=$VALUE
+            ;;
+        --critical)
+            CRITICAL_THRESHOLD=$VALUE
+            ;;
+        -h | --help)
+            usage
+            exit 0;
+            ;;
+    esac
+    shift
+done
+ 
+ 
+NOW=`date +%s`
+min_valid_ts=$(($NOW - $VALID_INTERVAL))
+ 
+CURRENT_PAGES_SWAPPED_IN=`vmstat -s | grep 'pages swapped in' | awk '{print $1}'`
+CURRENT_PAGES_SWAPPED_OUT=`vmstat -s | grep 'pages swapped out' | awk '{print $1}'`
+ 
+mkdir -p $(dirname $IN_DATAFILE)
+if [ ! -f $IN_DATAFILE ]; then
+    echo -e "$NOW\t$CURRENT_PAGES_SWAPPED_IN" > $IN_DATAFILE
+    echo "Missing $IN_DATAFILE; creating"
+    EXITFLAG=$UNKNOWN
+fi
+if [ ! -f $OUT_DATAFILE ]; then
+    echo -e "$NOW\t$CURRENT_PAGES_SWAPPED_OUT" > $OUT_DATAFILE
+    echo "Missing $OUT_DATAFILE; creating"
+    EXITFLAG=$UNKNOWN
+fi
+ 
+if [ $EXITFLAG != $OK ]; then
+    exit $EXITFLAG
+fi
+ 
+function swap_rate() {
+    local file=$1
+    local current=$2
+    local rate=0
+    
+    mv $file ${file}.previous
+    while read ts swap_count; do
+        if [[ $ts -lt $min_valid_ts ]]; then
+            continue
+        fi
+        if [[ $ts -ge $NOW ]]; then
+            # we can't use data from the same second
+            continue
+        fi
+        # calculate the rate
+        swap_delta=$(($current - $swap_count))
+        ts_delta=$(($NOW - $ts))
+        rate=`echo "$swap_delta / $ts_delta" | bc`
+        echo -e "$ts\t$swap_count" >> $file
+    done < ${file}.previous
+    echo -e "$NOW\t$current" >> $file
+    echo $rate
+}
+ 
+in_rate=`swap_rate $IN_DATAFILE $CURRENT_PAGES_SWAPPED_IN`
+out_rate=`swap_rate $OUT_DATAFILE $CURRENT_PAGES_SWAPPED_OUT`
+ 
+echo "swap in/out is $in_rate/$out_rate per second"
+if [[ $in_rate -ge $CRITICAL_THRESHOLD ]] || [[ $out_rate -ge $CRITICAL_THRESHOLD ]]; then
+    exit $CRITICAL
+fi
+if [[ $in_rate -ge $WARN_THRESHOLD ]] || [[ $out_rate -ge $WARN_THRESHOLD ]]; then
+    exit $WARNING
+fi
+exit $OK
+```
+
+
+## 4 - Server Boot Notification
+
+意外重启是生活的一部分，你知道它在你的主机上是什么时候发生的吗？大部分的人不知道，我们使用一个简单的初始化脚本来触发一个系统 boot 的 ops 邮件。沟通新服务的配置，和帮助捕获状态改变的信息即使业务正常处理故障不报警，这是非常有价值的。
+
+```
+#!/bin/bash
+#
+# *************************************************
+# chkconfig: 2345 99 99
+# description: notify email address on system boot.
+# *************************************************
+# Installing:
+# 1) save as /etc/rc.d/init.d/notify
+# 2) set the desired email address in "MAILADD" variable
+# 3) chmod a+w /etc/rc.d/init.d/notify
+# 4) /sbin/chkconfig --level 2345 notify on
+ 
+PATH=/bin:/usr/sbin:/usr/bin
+SERVER=`hostname`
+case $1 in
+    start)
+        PUBLIC_IP=`curl --connect-timeout 5 -s icanhazip.com`
+        PUBLIC_IPV6=`curl -6 --connect-timeout 5 -s icanhazip.com`
+        MAILADD=your@email.example
+        mail -s " Boot of $SERVER" $MAILADD <<EOF
+From: $0
+To: $MAILADD
+$SERVER has booted up.
+public ip $PUBLIC_IP $PUBLIC_IPV6
+If this is news to you, please investigate.
+`date -u`
+EOF
+    ;;
+esac
+exit 0
+```
+
+## 5 - NTP Clock Offset
+
+如果没监控，是的，你众多服务器中的一台可能是关闭的。如果你从没有考虑过时钟脉冲相位差，你可能并没有在您的服务器上运行 `ntpd`。
+
+我们使用 [check_ntp_time][5] 来检查。
+
+## 6 - DNS Resolutions
+
+内部 DNS - 它是你基础架构中比你认识到的更加信赖的隐藏部分。这个检查项是：
+
+ 1. 每台服务器的本地 resolutions
+ 2. 如果你在你的数据中心有本地的 DNS，你需要检查  resolution, 和 查询的数量
+ 3. 检查你使用的每个上游 DNS 解析器的可用性
+
+外部 DNS - 通过你发布的外部的 nameservers 是能很好的校验你的外部域名的正确解析的。在 bitly 我们信赖一些 CC TLD’s 并且我们也直接监控这些权威的服务器（是的，发生过所有的权威 nameservers 都下线的情况）
+
+## 7 - SSL Expiration
+
+因为它很少发生以至于每个人都忘记了这件事情。解决方案非常简单，仅仅需要检查它并且报警，然后留下足够的时间来更新你的 SSL  证书。
+
+```
+define command{
+    command_name    check_ssl_expire
+    command_line    $USER1$/check_http --ssl -C 14 -H $ARG1$
+}
+define service{
+    host_name               virtual
+    service_description     bitly_com_ssl_expiration
+    use                     generic-service
+    check_command           check_ssl_expire!bitly.com
+    contact_groups          email_only
+    normal_check_interval   720
+    retry_check_interval    10
+    notification_interval   720
+}
+```
+
+## 8 - DELL OpenManage Server Administrator (OMSA)
+
+我们在两个数据中心运行 bitly，一个是使用 DELL 硬件 作为管理环境，另外一个是 Amazon EC2。对我们的 DELL 硬件来说，监控我们的 OMSA 输出很重要。给我们报警 RAID 状态，磁盘故障（预兆或是硬性故障），RAM 问题，电源供给状态以及更多。
+
+## 9 - Connection Limits
+
+你可以使用连接限制运行一些如 memcached 和 mysql 的程序，但是当你扩展你的应用层时，你监控了多接近这些限制值的极限吗？
+
+与此相关的是解决问题的过程中遇到的文件描述符的限制。我们使用运行服务器的常规做法，在我们的运行脚本中设置 `ulimit -n 65535` 最小化这个问题。我们也设置 Nginx 的 [worker_rlimit_nofile][6]。
+
+## 10 - Load Balancer Status
+
+我们使用一个健康检查配置我的负载均衡，为了是任何给定的服务器从轮询中移除，我们可以非常简单的强迫它失败。我们已经发现重要的是要有可视性的健康检查的状态。因此我们基于同样的健康检查监控和报警（如果你使用 EC2 Load Balancers，你可以使用 Amazon API 来监控 ELB 状态）。
+
+## 其他的需要监控的
+
+写进 Nginx Error Logs 的最新日志，服务的重启（假设你在某些地方已经有一些东西来重启他们，但失败了），numa stats，新进程的 core dumps（如果你运行任何 C 代码）。
+
+
+
+
+
+
+ 
+
+
+  [1]: http://twitter.com/bitly
+  [2]: http://word.bitly.com/post/74839060954/ten-things-to-monitor
+  [3]: http://word.bitly.com/post/67486390974/networking-traffic-control
+  [4]: http://monolight.cc/2011/08/flow-control-flaw-in-broadcom-bcm5709-nics-and-bcm56xxx-switches/
+  [5]: http://www.nagios-plugins.org/doc/man/check_ntp_time.html
+  [6]: http://wiki.nginx.org/CoreModule#worker_rlimit_nofile
